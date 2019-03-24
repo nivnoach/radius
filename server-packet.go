@@ -2,6 +2,9 @@ package radius
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -10,8 +13,10 @@ import (
 
 type packetResponseWriter struct {
 	// listener that received the packet
-	conn net.PacketConn
-	addr net.Addr
+	conn           net.PacketConn
+	addr           net.Addr
+	addMessageAuth bool
+	secret         []byte
 }
 
 func (r *packetResponseWriter) Write(packet *Packet) error {
@@ -19,6 +24,26 @@ func (r *packetResponseWriter) Write(packet *Packet) error {
 	if err != nil {
 		return err
 	}
+
+	// Calculate and add Message Authenticator
+	if r.addMessageAuth {
+		// Fix the size
+		size := binary.BigEndian.Uint16(encoded[2:4])
+		size = size + 18 // Size of Message Authenticator with headers
+		binary.BigEndian.PutUint16(encoded[2:4], uint16(size))
+
+		// Add Message Authenticator 0 padded
+		msgAuthZeroed := [16]byte{}
+		encoded = append(encoded[:], msgAuthZeroed[:]...)
+
+		// Calculate Message Authenticator
+		hash := hmac.New(md5.New, r.secret)
+		hash.Write(encoded)
+
+		// Overwrite the Message Authenticator with the calcualted value
+		encoded = hash.Sum(encoded[:len(encoded)-16])
+	}
+
 	if _, err := r.conn.WriteTo(encoded, r.addr); err != nil {
 		return err
 	}
@@ -44,6 +69,10 @@ type PacketServer struct {
 	// Skip incoming packet authenticity validation.
 	// This should only be set to true for debugging purposes.
 	InsecureSkipVerify bool
+
+	// Indicates whether server should calculate and add Message Authenticator
+	// before sending RADIUS response
+	AddMessageAuthenticator bool
 
 	shutdownRequested int32
 
@@ -163,8 +192,10 @@ func (s *PacketServer) Serve(conn net.PacketConn) error {
 			requestsLock.Unlock()
 
 			response := packetResponseWriter{
-				conn: conn,
-				addr: remoteAddr,
+				conn:           conn,
+				addr:           remoteAddr,
+				addMessageAuth: s.AddMessageAuthenticator,
+				secret:         secret,
 			}
 
 			defer func() {
